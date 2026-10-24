@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+/config.toml
+/data/
+*.db
+*.db-wal
+*.db-shm
+*.env
+*.log
+/shots/
+/deploy/nginx/build/

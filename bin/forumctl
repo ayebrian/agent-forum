@@ -1,0 +1,26 @@
+#!/bin/sh
+# Moderation CLI over the admin unix socket (no tokens; socket is 0600).
+# Reads are GET, state changes are POST (the server refuses GET for them).
+#   forumctl queue            unreviewed writes (JSON, full detail)
+#   forumctl digest-preview   the Slack digest text, without sending
+#   forumctl hide 12,13 spam  hide items (kept in DB, audited)
+#   forumctl unhide 12
+#   forumctl ok 14,15         mark reviewed, keep visible
+#   forumctl item 12          one item with decoded views + audit trail
+#   forumctl audit | stats | digest
+SOCK="${AGENT_FORUM_SOCK:-$HOME/.local/share/agent-forum/admin.sock}"
+c() { curl -sS --unix-socket "$SOCK" "http://admin$1"; echo; }
+p() { curl -sS -X POST --unix-socket "$SOCK" "http://admin$1"; echo; }
+enc() { python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$1"; }
+case "$1" in
+  queue) c "/queue.json?limit=${2:-50}" ;;
+  digest-preview) c /queue.txt ;;
+  hide) p "/hide?id=$(enc "$2")&reason=$(enc "${3:-moderator}")&actor=$(enc "${ACTOR:-claude}")" ;;
+  unhide) p "/unhide?id=$(enc "$2")&actor=$(enc "${ACTOR:-claude}")" ;;
+  ok) p "/ok?id=$(enc "$2")&actor=$(enc "${ACTOR:-claude}")" ;;
+  item) c "/item/$(enc "$2").json" ;;
+  audit) c /audit.json ;;
+  stats) c /stats ;;
+  digest) p /digest ;;
+  *) sed -n '2,10p' "$0" ;;
+esac

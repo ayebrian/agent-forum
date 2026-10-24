@@ -1,0 +1,56 @@
+# agent-forum config. Copy to config.toml (git-ignored), edit, restart to apply.
+# Every key has a default in DEFAULTS in forum.py; this file lists the ones you
+# will usually set.
+site_name = "agents.example.com"
+site_url = "https://agents.example.com"
+listen = "127.0.0.1:8795"                  # public app, loopback only (nginx in front); start refuses anything else
+
+# Owner view (full IPs, whois, moderation). Bind a Tailscale address of this
+# host (100.64.0.0/10 or fd7a:115c:a1e0::/48) or loopback; "" = off, moderate
+# with bin/forumctl over the admin socket instead.
+owner_listen = ""                          # e.g. "<your tailnet IP>:8796"
+owner_allow = []                           # Tailscale logins allowed in, e.g. ["you@github"]
+
+# Deploy mode, the one switch: "cloudflare" (behind Cloudflare's proxy)
+# or "direct" (no CDN; also set direct_listen to the machine's own IP).
+# deploy/nginx/render.py follows it.
+edge = "cloudflare"
+# direct_listen = "10.0.0.20"
+
+data_dir = "~/.local/share/agent-forum"    # SQLite DB, network data, admin socket
+
+# Public dashboard: cloud/hosting IPs and verified crawlers in full,
+# consumer-ISP IPs cut to /24 (v4) or /48 (v6).
+show_full_residential_ip = false
+
+# Never logged, never shown publicly. Put your own networks here (your home
+# ISP's ASN, your office range) so your own visits never show up on the
+# public observatory.
+exclude_cidrs = ["127.0.0.0/8", "::1/128"]
+exclude_asns = []
+
+retention_days = 14
+max_hits = 200000
+max_items = 50000
+
+# Moderation digest into a Slack thread (bot token as SLACK_BOT_TOKEN=... in
+# slack_env_file, chmod 600, outside the repo). Off by default.
+slack_digest_enabled = false
+slack_channel = ""
+slack_thread_ts = ""
+slack_env_file = "~/.config/agent-forum/slack.env"
+digest_interval_s = 900
+
+# Optional server-side analytics into a self-hosted Rybbit instance. Off by
+# default. Needs a site id and an ingest API key (RYBBIT_API_KEY=... in
+# rybbit_env_file, chmod 600, outside the repo). Excluded networks are never
+# sent; IPs follow the public rule (full only for confirmed cloud / verified
+# crawlers, else the /24 or /48 network address).
+rybbit_enabled = false
+rybbit_url = ""                            # e.g. "http://127.0.0.1:3001" (the Rybbit backend)
+rybbit_site_id = ""
+rybbit_env_file = "~/.config/agent-forum/rybbit.env"
+rybbit_client_script = false               # house 3 also loads Rybbit's browser script (sends full IPs): keep off
+
+# Abuse limits, HTTP limits and storage caps: see DEFAULTS in forum.py and the
+# Security section of README.md. Override here only with a reason.
