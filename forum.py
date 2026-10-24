@@ -89,6 +89,9 @@ DEFAULTS = {
     "rybbit_client_script": False,
     "rybbit_public_url": "",
     "max_house_rows": 50000,          # "three houses" experiment, one row per page view
+    # A browser asks for the house image / runs the script within seconds of the
+    # page; a later fetch of the same token is a crawler working through a queue.
+    "house_render_window_s": 30,
     # --- abuse limits (token buckets: [burst, refill per second])
     "rate_read_ip": [60, 5.0],        # every request, per IP (IPv6: per /64)
     "rate_read_asn": [600, 50.0],
@@ -919,7 +922,9 @@ def render_houses_index():
     body = f"""<h1 class="pg">Three houses</h1>
 <p class="lede">An open experiment: three nearly identical pages. The first is plain HTML, the second adds a 1x1 image,
 the third adds the image and a small first-party script. Which stage a visitor reaches says what kind of client it is:
-an HTML-only fetcher, a client that loads resources, or one that runs JavaScript.</p>
+an HTML-only fetcher, a client that loads resources, or one that runs JavaScript. Timing counts too: a browser
+fetches the image within seconds of the page ({int(CFG['house_render_window_s'])} s window), while a crawler that queues the
+image URL it found fetches it minutes or hours later.</p>
 <ul class="side wide">{items}</ul>
 <p class="how">Results per visitor are in the <a href="/observatory">observatory</a>.</p>"""
     return page(f"Three houses · {CFG['site_name']}", body)
@@ -936,56 +941,96 @@ def js_info(P):
     return ";".join(out)[:160]
 
 
+# Verdicts for one house view (and, best one wins, for a visitor), strongest first,
+# with their key in the observatory summary. The page token ties the image and the
+# script ping to the view; the delay since the view tells a browser rendering the
+# page (seconds) from a crawler fetching queued URLs later (minutes to hours).
+HOUSE_VERDICTS = [("ran JS", "js"), ("rendered", "pixel"), ("ran JS later (deferred render)", "js_deferred"),
+                  ("fetched image later (crawler)", "pixel_deferred"), ("HTML only", "html_only"),
+                  ("house 1 only", "house1_only")]
+HOUSE_RANK = {v: i for i, (v, _) in enumerate(HOUSE_VERDICTS)}
+
+
+def house_delay(stage_ts, view_ts):
+    """Seconds from the page view (token issued) to a later stage; None if never."""
+    return None if not stage_ts else max(0, int(stage_ts) - int(view_ts))
+
+
+def dur(s):
+    """3 s, 4 min, 1.0 h, 2.5 d."""
+    s = int(s)
+    return f"{s} s" if s < 120 else f"{round(s / 60)} min" if s < 7200 else f"{s / 3600:.1f} h" if s < 172800 \
+        else f"{s / 86400:.1f} d"
+
+
+def house_verdict(house, ts, px_ts, js_ts, window=None):
+    """One view: "rendered" / "ran JS" only if the image / script ping came within
+    house_render_window_s of the page; later = deferred (queued fetch or render)."""
+    w = CFG["house_render_window_s"] if window is None else window
+    pd, jd = house_delay(px_ts, ts), house_delay(js_ts, ts)
+    if jd is not None and jd <= w:
+        return "ran JS"
+    if pd is not None and pd <= w:
+        return "rendered"
+    if jd is not None:
+        return "ran JS later (deferred render)"
+    if pd is not None:
+        return "fetched image later (crawler)"
+    return "HTML only" if house >= 2 else "house 1 only"
+
+
 def houses_public(c, since, hide, hargs):
     """Observatory section: per visitor (user agent + public network form of the
-    IP), which stages its house views reached."""
+    IP), which stages its house views reached and how long after the page."""
+    w = CFG["house_render_window_s"]
     rows = c.execute(f"SELECT ip, asn, ua_id, house, verify, ts, px_ts, js_ts FROM houses WHERE ts>=? {hide} "
                      "ORDER BY ts DESC LIMIT 5000", (since, *hargs)).fetchall()
     vis = {}
     views = {1: 0, 2: 0, 3: 0}
-    px = {2: 0, 3: 0}
-    js = 0
+    px, px_now = {2: 0, 3: 0}, {2: 0, 3: 0}
+    js = js_now = 0
     for r in rows:
+        pd, jd = house_delay(r["px_ts"], r["ts"]), house_delay(r["js_ts"], r["ts"])
         views[r["house"]] = views.get(r["house"], 0) + 1
-        if r["house"] in px and r["px_ts"]:
+        if r["house"] in px and pd is not None:
             px[r["house"]] += 1
-        if r["house"] == 3 and r["js_ts"]:
+            px_now[r["house"]] += pd <= w
+        if r["house"] == 3 and jd is not None:
             js += 1
+            js_now += jd <= w
         d = NET.describe_ip(r["ip"]) if r["ip"] else NET.describe_asn(None)
         key = (r["ua_id"], public_ip(r["ip"], d, r["verify"]) if r["ip"] else "")
         v = vis.setdefault(key, {"ua_id": r["ua_id"], "ip": key[1], "net": d["label"], "houses": set(), "px": False,
-                                 "js": False, "resources_offered": False, "last": 0, "n": 0})
+                                 "js": False, "pd": None, "jd": None, "verdict": "house 1 only", "last": 0, "n": 0})
         v["houses"].add(r["house"])
         v["n"] += 1
         v["last"] = max(v["last"], r["ts"])
-        v["resources_offered"] |= r["house"] >= 2
-        v["px"] |= bool(r["px_ts"])
-        v["js"] |= bool(r["js_ts"])
+        v["px"] |= pd is not None
+        v["js"] |= jd is not None
+        if pd is not None:
+            v["pd"] = pd if v["pd"] is None else min(v["pd"], pd)
+        if jd is not None:
+            v["jd"] = jd if v["jd"] is None else min(v["jd"], jd)
+        vd = house_verdict(r["house"], r["ts"], r["px_ts"], r["js_ts"], w)
+        if HOUSE_RANK[vd] < HOUSE_RANK[v["verdict"]]:
+            v["verdict"] = vd
     labels = {}
     ids = sorted({v["ua_id"] for v in vis.values() if v["ua_id"]})
     if ids:
         for u in c.execute(f"SELECT id, label, kind FROM uas WHERE id IN ({','.join('?' * len(ids))})", ids):
             labels[u["id"]] = (public_label(u["label"]), u["kind"])
-    out, summary = [], {"visitors": len(vis), "html_only": 0, "pixel": 0, "js": 0, "house1_only": 0}
+    out = []
+    summary = {"visitors": len(vis), **{k: 0 for _, k in HOUSE_VERDICTS}}
     for v in vis.values():
-        if v["js"]:
-            verdict = "ran JS"
-            summary["js"] += 1
-        elif v["px"]:
-            verdict = "loaded image"
-            summary["pixel"] += 1
-        elif v["resources_offered"]:
-            verdict = "HTML only"
-            summary["html_only"] += 1
-        else:
-            verdict = "house 1 only"
-            summary["house1_only"] += 1
+        summary[dict(HOUSE_VERDICTS)[v["verdict"]]] += 1
         lab, kind = labels.get(v["ua_id"], ("?", "unknown"))
         out.append({"label": lab, "kind": kind, "ip": v["ip"], "network": v["net"], "houses": sorted(v["houses"]),
-                    "pixel": v["px"], "js": v["js"], "verdict": verdict, "views": v["n"], "last": v["last"]})
+                    "pixel": v["px"], "js": v["js"], "pixel_delay_s": v["pd"], "js_delay_s": v["jd"],
+                    "verdict": v["verdict"], "views": v["n"], "last": v["last"]})
     out.sort(key=lambda x: -x["last"])
-    return {"summary": summary, "views": {str(k): n for k, n in views.items()},
-            "pixel_loaded": {str(k): n for k, n in px.items()}, "js_ran": js, "visitors": out[:40]}
+    return {"summary": summary, "render_window_s": w, "views": {str(k): n for k, n in views.items()},
+            "pixel_loaded": {str(k): n for k, n in px.items()}, "js_ran": js,
+            "pixel_in_window": {str(k): n for k, n in px_now.items()}, "js_in_window": js_now, "visitors": out[:40]}
 
 
 def howto_text(tag="howto", invite=True):

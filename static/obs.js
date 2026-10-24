@@ -267,16 +267,21 @@
   function renderHouses(d) {
     const H = d.houses;
     if (!H) { $("houses-sum").textContent = "Shown for everyone only (clear the visitor filter)."; $("houses").replaceChildren(); return; }
-    const s = H.summary;
+    const s = H.summary, win = H.render_window_s || 30;
+    const late = (s.pixel_deferred || 0) + (s.js_deferred || 0);
     $("houses-sum").textContent = fmt(s.visitors) + " visitors: " + fmt(s.html_only) + " fetched HTML only, " + fmt(s.pixel) +
-      " also loaded the image, " + fmt(s.js) + " ran JavaScript, " + fmt(s.house1_only) + " saw only house 1. Views: house 1 " +
-      fmt(H.views["1"] || 0) + ", house 2 " + fmt(H.views["2"] || 0) + " (image loaded " + fmt(H.pixel_loaded["2"] || 0) + "), house 3 " +
-      fmt(H.views["3"] || 0) + " (image " + fmt(H.pixel_loaded["3"] || 0) + ", script " + fmt(H.js_ran) + ").";
-    const yes = (b) => b ? "yes" : "no";
+      " rendered the page (image within " + win + " s), " + fmt(s.js) + " ran JavaScript, " + fmt(late) +
+      " fetched the image or script only later (a queued crawler fetch, not a render), " + fmt(s.house1_only) +
+      " saw only house 1. Views: house 1 " + fmt(H.views["1"] || 0) + ", house 2 " + fmt(H.views["2"] || 0) + " (image loaded " +
+      fmt(H.pixel_loaded["2"] || 0) + "), house 3 " + fmt(H.views["3"] || 0) + " (image " + fmt(H.pixel_loaded["3"] || 0) +
+      ", script " + fmt(H.js_ran) + ").";
+    const dur = (n) => n < 120 ? n + " s" : n < 7200 ? Math.round(n / 60) + " min" : n < 172800 ? (n / 3600).toFixed(1) + " h" : (n / 86400).toFixed(1) + " d";
+    const after = (d) => d == null ? "no" : "+" + dur(d) + (d > win ? " (late)" : "");
     table("houses", [
       { t: "client", cls: "wrap", f: (r) => [h("b", {}, r.label), h("span", { class: "op" }, r.network + (r.ip ? " · " + r.ip : ""))] },
-      { t: "houses", f: (r) => r.houses.join(", ") }, { t: "HTML", f: () => "yes" }, { t: "image", f: (r) => yes(r.pixel) },
-      { t: "JS", f: (r) => yes(r.js) }, { t: "verdict", f: (r) => r.verdict }, { t: "views", num: 1, f: (r) => fmt(r.views) },
+      { t: "houses", f: (r) => r.houses.join(", ") }, { t: "HTML", f: () => "yes" },
+      { t: "image after page", f: (r) => after(r.pixel_delay_s) }, { t: "JS after page", f: (r) => after(r.js_delay_s) },
+      { t: "verdict", f: (r) => r.verdict }, { t: "views", num: 1, f: (r) => fmt(r.views) },
     ], H.visitors, "Nobody has visited the houses in this window.");
   }
 

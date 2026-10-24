@@ -8,6 +8,7 @@ import json
 import os
 import re
 import socket
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -279,11 +280,16 @@ class Forum(unittest.TestCase):
         self.assertEqual(len(browser), 1, by)
         b = browser[0]
         self.assertEqual((b["houses"], b["pixel"], b["js"], b["verdict"]), ([1, 2, 3], True, True, "ran JS"))
+        self.assertLessEqual(b["pixel_delay_s"], 30)
+        self.assertLessEqual(b["js_delay_s"], 30)
         curl = [v for (lab, ip), v in by.items() if ip == "203.0.113.x"][0]
         self.assertEqual((curl["houses"], curl["pixel"], curl["js"], curl["verdict"]), ([1, 2, 3], False, False, "HTML only"))
+        self.assertEqual((curl["pixel_delay_s"], curl["js_delay_s"]), (None, None))
         wget = [v for (lab, ip), v in by.items() if ip.startswith("2001:db8:abcd::")][0]
         self.assertEqual(wget["verdict"], "house 1 only")
-        self.assertEqual(H["summary"], {"visitors": 3, "html_only": 1, "pixel": 0, "js": 1, "house1_only": 1})
+        self.assertEqual(H["summary"], {"visitors": 3, "html_only": 1, "pixel": 0, "js": 1, "house1_only": 1,
+                                        "pixel_deferred": 0, "js_deferred": 0})
+        self.assertEqual(H["render_window_s"], 30)
         self.assertEqual(H["views"], {"1": 3, "2": 2, "3": 2})
         self.assertEqual(H["pixel_loaded"], {"2": 1, "3": 1})
         self.assertEqual(H["js_ran"], 1)
@@ -328,6 +334,83 @@ class Forum(unittest.TestCase):
         for n in (1, 2, 3):
             self.assertIn(f'href="/houses/{n}"', front)
             self.assertIn(f"/houses/{n}", llms)
+
+
+class HouseTiming(unittest.TestCase):
+    """The page token ties the image / script ping to the view; the delay since the
+    view tells a browser rendering the page from a crawler fetching queued URLs
+    later (seen live: ClaudeBot fetched two house pixels ~1 h after the HTML)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.f = f = Instance(rate_read_ip=[100000, 1000.0], rate_log_ip=[100000, 1000.0])
+        bot = {"User-Agent": "Mozilla/5.0 (compatible; ExampleCrawler/1.0)"}
+        hb = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) HeadlessChrome/140.0 Safari/537.36"}
+        tok = {}
+        for name, n, ip, h in (("now", 2, CLOUD_V4, {"User-Agent": BROWSER}), ("late", 2, RESIDENTIAL_V4, bot),
+                               ("js", 3, RESIDENTIAL_V6, {"User-Agent": BROWSER}), ("jslate", 3, CLOUD_V4, hb)):
+            st, _, body = f.get(f"/houses/{n}", ip=ip, headers=h)
+            assert st == 200, (name, st)
+            tok[name] = (n, ip, h, token_of(body))
+        time.sleep(1.2)   # view rows are written by the batching hit writer
+        # the crawler's page view and the headless render happened an hour ago
+        db = sqlite3.connect(os.path.join(f.dir, "forum.sqlite3"), timeout=10)
+        with db:
+            for name in ("late", "jslate"):
+                db.execute("UPDATE houses SET ts=ts-3600 WHERE token=?", (tok[name][3],))
+        db.close()
+        for name in ("now", "late"):
+            n, ip, h, t = tok[name]
+            f.get(f"/houses/{n}/px.gif?r={t}", ip=ip, headers=h)
+        for name in ("js", "jslate"):
+            n, ip, h, t = tok[name]
+            f.get(f"/houses/3/js-ping?r={t}&wd=0", ip=ip, headers=h)
+        time.sleep(1.5)
+        cls.H = json.loads(f.get("/api/observatory.json?window=24h")[2])["houses"]
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.f.stop()
+
+    def visitor(self, ip, houses):
+        return [v for v in self.H["visitors"] if v["ip"].startswith(ip) and v["houses"] == houses][0]
+
+    def test_immediate_pixel_is_rendered(self):
+        v = self.visitor(CLOUD_V4, [2])
+        self.assertEqual(v["verdict"], "rendered")
+        self.assertLessEqual(v["pixel_delay_s"], 30)
+
+    def test_pixel_an_hour_later_is_crawler_deferred(self):
+        v = self.visitor("203.0.113.", [2])
+        self.assertEqual(v["verdict"], "fetched image later (crawler)")
+        self.assertTrue(v["pixel"])
+        self.assertGreaterEqual(v["pixel_delay_s"], 3600)
+        self.assertLess(v["pixel_delay_s"], 3700)
+
+    def test_js_ping_ran_js(self):
+        v = self.visitor("2001:db8:abcd::", [3])
+        self.assertEqual(v["verdict"], "ran JS")
+        self.assertLessEqual(v["js_delay_s"], 30)
+        late = self.visitor(CLOUD_V4, [3])
+        self.assertEqual(late["verdict"], "ran JS later (deferred render)")
+        self.assertGreaterEqual(late["js_delay_s"], 3600)
+
+    def test_counts(self):
+        H = self.H
+        self.assertEqual(H["summary"], {"visitors": 4, "js": 1, "pixel": 1, "js_deferred": 1, "pixel_deferred": 1,
+                                        "html_only": 0, "house1_only": 0})
+        self.assertEqual((H["pixel_loaded"], H["pixel_in_window"]), ({"2": 2, "3": 0}, {"2": 1, "3": 0}))
+        self.assertEqual((H["js_ran"], H["js_in_window"]), (2, 1))
+
+    def test_owner_view_shows_delay(self):
+        self.f.ts.idents["127.0.0.10"] = {"login": "owner@github", "name": "laptop", "tags": []}
+        st, _, body = self.f.owner("/houses", "127.0.0.10")
+        text = body.decode()
+        self.assertEqual(st, 200)
+        self.assertIn("fetched image later (crawler)", text)
+        self.assertIn("ran JS later (deferred render)", text)
+        self.assertRegex(text, r"\+1\.0 h \(late\)|\+60 min \(late\)")
+        self.assertIn(">rendered<", text)
 
 
 class RybbitDown(unittest.TestCase):

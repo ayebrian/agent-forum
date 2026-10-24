@@ -282,14 +282,18 @@ def page_houses():
     tot = F.q1("SELECT count(*) n, sum(house>=2) offered, sum(px_ts IS NOT NULL) px, sum(house=3) h3, sum(js_ts IS NOT NULL) js "
                "FROM houses")
 
+    win = F.CFG["house_render_window_s"]
+
     def stage(ts, same, base, n):
-        if not ts:
+        dl = F.house_delay(ts, base)
+        if dl is None:
             return "-"
-        return f"+{int(ts - base)} s" + ("" if same else " (other IP/UA)") + (f" ×{int(n)}" if n and n > 1 else "")
+        return (f"+{F.dur(dl)}" + ("" if dl <= win else " (late)") + ("" if same else " (other IP/UA)")
+                + (f" ×{int(n)}" if n and n > 1 else ""))
     tr = []
     for r in rows:
         d = F.NET.describe_ip(r["ip"]) if r["ip"] else {"label": "?"}
-        verdict = "ran JS" if r["js_ts"] else "loaded image" if r["px_ts"] else "HTML only" if r["house"] >= 2 else "house 1"
+        verdict = F.house_verdict(r["house"], r["ts"], r["px_ts"], r["js_ts"], win)
         tr.append(f"<tr><td>{time.strftime('%m-%d %H:%M:%S', time.gmtime(r['ts']))}</td><td class='num'>{int(r['house'])}</td>"
                   f"<td><a href='/ip/{esc(r['ip'])}'>{esc(r['ip'])}</a></td><td>{esc(d['label'])}</td>"
                   f"<td title='{esc(r['ua'])}'>{esc(r['label'])}</td><td>{esc(r['verify'] or '')}</td>"
@@ -298,6 +302,7 @@ def page_houses():
                   f"<td>{esc(verdict)}</td></tr>")
     head = (f"<p class='small'>{int(tot['n'] or 0)} views kept; image loaded on {int(tot['px'] or 0)} of {int(tot['offered'] or 0)} "
             f"views of houses 2-3; script ran on {int(tot['js'] or 0)} of {int(tot['h3'] or 0)} views of house 3. "
+            f"Image/script columns: delay after the page; over {int(win)} s = late (a queued fetch, not a page render). "
             "Owner networks are never recorded.</p>")
     return shell("houses", "<h1 class='pg'>Three houses, newest 500 views</h1>" + head +
                  "<table class='kv hits'><thead><tr><th>UTC</th><th>house</th><th>IP</th><th>network</th><th>UA</th><th>check</th>"
