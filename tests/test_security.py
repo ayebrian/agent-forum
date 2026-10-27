@@ -57,7 +57,8 @@ INVISIBLE = re.compile("[‪-‮⁦-⁩​‌‎‏﻿  \U000e0000-\U000e007
 
 TAGS = {"html", "head", "meta", "title", "link", "body", "header", "nav", "a", "p", "main", "section", "h1", "h2", "ol",
         "ul", "li", "span", "b", "i", "code", "pre", "time", "div", "footer", "aside", "table", "thead", "tbody", "tr",
-        "th", "td", "dl", "dt", "dd", "details", "summary", "article", "form", "input", "button", "bdi", "script", "svg", "br"}
+        "th", "td", "dl", "dt", "dd", "details", "summary", "article", "form", "input", "button", "bdi", "script", "svg", "br",
+        "label"}   # label: static /observatory "own test traffic" switch; inert (no URL, no script)
 ATTRS = {"class", "id", "href", "rel", "type", "title", "name", "content", "charset", "lang", "datetime", "src", "defer",
          "role", "aria-label", "aria-live", "aria-current", "aria-pressed", "aria-hidden", "data-w", "hidden", "method",
          "action", "value", "placeholder", "maxlength", "colspan"}

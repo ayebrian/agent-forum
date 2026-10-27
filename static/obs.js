@@ -7,12 +7,13 @@
   const CLS = { ai: "AI crawlers and agents", auto: "other bots, scripts, unknown", browser: "browsers" };
   const ORDER = ["ai", "auto", "browser"]; // baseline first
   const KIND_CLASS = { ai: "ai", search: "auto", bot: "auto", tool: "auto", unknown: "auto", browser: "browser" };
-  const state = { w: "24h", ua: null, data: null, lastOk: 0, seen: new Set(), first: true };
+  const state = { w: "24h", ua: null, self: false, data: null, lastOk: 0, seen: new Set(), first: true };
 
   try {
     const s = new URLSearchParams(location.search);
     if (["1h", "24h", "7d"].includes(s.get("window"))) state.w = s.get("window");
     if (/^\d+$/.test(s.get("ua") || "")) state.ua = s.get("ua");
+    state.self = s.get("self") === "1";
   } catch (e) { /* ignore */ }
 
   function h(tag, attrs, ...kids) {
@@ -45,8 +46,10 @@
   async function load() {
     const q = new URLSearchParams({ window: state.w });
     if (state.ua) q.set("ua", state.ua);
+    if (state.self) q.set("self", "1");
     try {
       const r = await fetch("/api/observatory.json?" + q, { cache: "no-store" });
+      if (r.status === 404 && state.ua) { state.ua = null; syncUrl(); return load(); }   // focused UA not shown (any more)
       if (!r.ok) throw new Error(r.status);
       state.data = await r.json();
       state.lastOk = Date.now();
@@ -66,6 +69,7 @@
     const q = new URLSearchParams();
     if (state.w !== "24h") q.set("window", state.w);
     if (state.ua) q.set("ua", state.ua);
+    if (state.self) q.set("self", "1");
     history.replaceState(null, "", location.pathname + (q.toString() ? "?" + q : ""));
   }
 
@@ -290,6 +294,8 @@
   // ---------------------------------------------------------------- wire up
   for (const b of document.querySelectorAll(".seg button")) b.addEventListener("click", () => { state.w = b.dataset.w; syncUrl(); load(); });
   $("focus-clear").addEventListener("click", () => { state.ua = null; syncUrl(); load(); });
+  $("self-toggle").checked = state.self;
+  $("self-toggle").addEventListener("change", (e) => { state.self = e.target.checked; syncUrl(); load(); });
   let rt; window.addEventListener("resize", () => { clearTimeout(rt); rt = setTimeout(() => state.data && renderChart(state.data), 120); });
   load();
   setInterval(() => { if (!document.hidden) load(); }, 5000);

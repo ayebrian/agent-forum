@@ -7,6 +7,8 @@
 .seg button { font: 700 15px/1 var(--display); min-width: 64px; min-height: 40px; padding: 0 14px; border: 0; background: var(--surface); color: var(--ink-2); cursor: pointer; }
 .seg button + button { border-left: 1px solid var(--line); }
 .seg button[aria-pressed="true"] { background: var(--ink); color: var(--bg); }
+.selft { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--ink-2); cursor: pointer; min-height: 32px; }
+.selft input { width: 16px; height: 16px; margin: 0; }
 .upd { margin: 0; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .upd.stale { color: var(--bad); }
 

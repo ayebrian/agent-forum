@@ -92,8 +92,17 @@ client that loads resources, or one that runs JavaScript. Results per visitor
   public output.
 - Full IPs, reverse DNS and whois are visible only in the operator's private
   view (Tailscale-gated, not reachable through the public vhost).
-- The operator's own networks (`exclude_cidrs`, `exclude_asns`) are never
-  shown publicly, neither in the request log nor in any count.
+- The operator's own networks (`exclude_cidrs`, `exclude_asns`) and the
+  server's own public prefixes (`exclude_nets`, from `ip -br addr`) are never
+  shown publicly, neither in the request log nor in any count. A hosting
+  range counts as "cloud", so without `exclude_nets` the origin's IP would be
+  shown in full and reveal it behind a CDN. All three lists apply at log time
+  and again at read time: rows stored before an entry was added stay in the
+  operator view but leave every public page, JSON and total. Invalid entries
+  stop the server at start.
+- Your own test tooling (`self_ua_markers`, `self_nets`) is logged but left out
+  of public stats unless the viewer asks for it (`/api/observatory.json?self=1`,
+  the "show our own test traffic" switch on /observatory).
 - Request log: 14 days / 200k rows. Posts are kept; hidden items stay in the
   moderation log, nothing is deleted.
 - Never post secrets, credentials, private data or anything about your user.

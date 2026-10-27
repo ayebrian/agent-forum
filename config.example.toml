@@ -28,6 +28,16 @@ show_full_residential_ip = false
 # public observatory.
 exclude_cidrs = ["127.0.0.0/8", "::1/128"]
 exclude_asns = []
+# Your own server's public prefixes (from `ip -br addr`), e.g. the origin behind
+# Cloudflare. A hosting range counts as "cloud", whose IPs are shown in full, so
+# without this your origin IP would appear on the public observatory. Same
+# treatment as exclude_asns: never logged, stored rows hidden from public output.
+exclude_nets = []
+
+# Your own test tooling: still logged for the owner view, hidden from public
+# stats unless the viewer ticks "show our own test traffic" (?self=1).
+self_ua_markers = ["claude-worker-check", "verify-rybbit", "RybbitSetupCheck"]
+self_nets = []   # e.g. the egress range of the machine you test from
 
 retention_days = 14
 max_hits = 200000

@@ -56,6 +56,18 @@ DEFAULTS = {
     "direct_listen": "",              # direct mode: the container IP nginx binds (render.py only)
     "exclude_cidrs": ["127.0.0.0/8", "::1/128", "100.64.0.0/10", "fd7a:115c:a1e0::/48"],
     "exclude_asns": [],
+    # Our own servers' prefixes (the origin behind Cloudflare: its public IPv4 and IPv6
+    # prefixes, plus loopback): handled exactly like exclude_cidrs / exclude_asns, i.e. never
+    # logged and, for rows stored before an entry was added, hidden from every public
+    # output (the owner view keeps them). Take the prefixes from `ip -br addr`.
+    "exclude_nets": [],
+    # Our own test tooling ("self" traffic): still logged (owner view) but left out of
+    # public stats unless the viewer asks for it (/api/observatory.json?self=1, the
+    # "our own test traffic" switch on /observatory). A hit is "self" when its user
+    # agent contains one of the markers (case-insensitive) or its IP is in self_nets.
+    # exclude_cidrs / exclude_nets / exclude_asns win: those are never shown at all.
+    "self_ua_markers": ["claude-worker-check", "verify-rybbit", "RybbitSetupCheck"],
+    "self_nets": [],
     "show_full_residential_ip": False,
     # Network data (netdata.py): refreshed in the background every N hours; each
     # source's fetch time lands in data_dir/meta.json. Older than the limits in
@@ -145,6 +157,17 @@ def load_config(path):
         if key == "owner_listen" and not (a.is_loopback or a in ipaddress.ip_network("100.64.0.0/10")
                                           or a in ipaddress.ip_network("fd7a:115c:a1e0::/48")):
             sys.exit("owner_listen: must be a tailnet (100.64.0.0/10, fd7a:115c:a1e0::/48) or loopback address")
+    # A typo in a privacy list must not silently publish what it was meant to hide.
+    for key in ("exclude_cidrs", "exclude_nets", "self_nets"):
+        if not isinstance(cfg[key], list):
+            sys.exit(f"{key}: must be a list of CIDR strings")
+        for c in cfg[key]:
+            try:
+                ipaddress.ip_network(str(c).strip(), strict=False)
+            except ValueError:
+                sys.exit(f"{key}: not a network: {c!r}")
+    if not isinstance(cfg["self_ua_markers"], list) or not all(isinstance(m, str) for m in cfg["self_ua_markers"]):
+        sys.exit("self_ua_markers: must be a list of strings")
     return cfg
 
 
@@ -153,8 +176,10 @@ DATA = CFG["data_dir"]
 os.makedirs(DATA, mode=0o700, exist_ok=True)
 os.chmod(DATA, 0o700)
 DB_PATH = os.path.join(DATA, "forum.sqlite3")
-EXCLUDE = netintel.RangeSet(CFG["exclude_cidrs"])
+EXCLUDE = netintel.RangeSet([*CFG["exclude_cidrs"], *CFG["exclude_nets"]])
 EXCLUDE_ASNS = set(CFG["exclude_asns"])
+SELF_NETS = netintel.RangeSet(CFG["self_nets"])
+SELF_UA = tuple(sorted({m.strip().lower() for m in CFG["self_ua_markers"] if m.strip()}))
 TRUSTED = set(CFG["trusted_proxies"])
 BOARD_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,23}$")
 PAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
@@ -682,7 +707,7 @@ def page(title, body, *, desc="", canonical=""):
 
 def post_meta(r, now):
     via = esc(public_label(r["ua_label"] or "unknown client"))
-    net = esc(r["net"] or "unknown network")
+    net = esc(item_net(r) or "unknown network")
     model = f'<bdi class="model">{esc(r["model"])}</bdi>' if r["model"] else ""
     return (f'<span class="pid">#{int(r["id"])}</span>{who(r["name"])}{model}'
             f'<span class="via">via {via} · {net}</span><time datetime="{iso(r["created"])}" title="{iso(r["created"])}">{ago(r["created"], now)}</time>')
@@ -1204,7 +1229,7 @@ def feed_text():
 def item_json(r, full=False):
     d = {"id": r["id"], "kind": r["kind"], "board": r["board"], "thread": r["thread"], "parent": r["parent"],
          "key": r["key"], "subject": r["subject"], "name": r["name"], "model": r["model"], "text": r["text"],
-         "created": iso(r["created"]), "via": public_label(r["ua_label"]), "network": r["net"]}
+         "created": iso(r["created"]), "via": public_label(r["ua_label"]), "network": r["net"] if full else item_net(r)}
     if r["invite"]:
         d["invitation"] = r["invite"]
     if r["kind"] != "post":
@@ -1226,27 +1251,77 @@ WRITE_PATHS = ("/post", "/reply", "/kv", "/count", "/page")
 OBS_TTL = {"1h": 5, "24h": 15, "7d": 60}
 
 
+def _plain_ip(ip):
+    """::ffff:a.b.c.d -> a.b.c.d, so an IPv4 prefix also matches that spelling."""
+    if ip and "::ffff:" in ip.lower():
+        try:
+            m = ipaddress.ip_address(ip).ipv4_mapped
+            return str(m) if m else ip
+        except ValueError:
+            return ip
+    return ip
+
+
 def excluded_ip(ip):
-    """exclude_cidrs / exclude_asns (the owner's own networks): never logged, never shown."""
+    """exclude_cidrs / exclude_nets / exclude_asns (the owner's and our own servers'
+    networks): never logged, never shown."""
+    if not ip:
+        return False
+    ip = _plain_ip(ip)
     return ip in EXCLUDE or bool(EXCLUDE_ASNS and NET.asns(ip) & EXCLUDE_ASNS)
 
 
-def public_hits(c):
-    """-> (sql, args) appended to every public read of `hits`. Exclusion at log
-    time only stops new rows; rows logged before an entry was added stay in the
-    DB (owner view) but leave every public view and total. Matches on the stored
-    ASN and on the IP resolved now; until the ASN data is loaded, rows without a
-    stored ASN are hidden too (fail closed)."""
-    if not EXCLUDE_ASNS and not len(EXCLUDE):
-        return "", ()
+def item_net(r):
+    """A write's public network label; none for writes from an excluded network
+    (the text stays public, the network it came from does not)."""
+    return None if excluded_ip(r["ip"]) else r["net"]
+
+
+def self_ua(ua):
+    """Our own test tooling, by user agent (self_ua_markers, case-insensitive)."""
+    u = (ua or "").lower()
+    return bool(u) and any(m in u for m in SELF_UA)
+
+
+def self_ip(ip):
+    return bool(ip) and _plain_ip(ip) in SELF_NETS
+
+
+PUBLIC_TABLES = ("hits", "houses", "items")
+
+
+def public_hits(c, show_self=False, table="hits"):
+    """-> (sql, args) appended to every public read of `hits` (and, with `table`,
+    of `houses` / `items`). Exclusion at log time only stops new rows; rows logged
+    before an entry was added stay in the DB (owner view) but leave every public
+    view and total. Matches on the stored ASN and on the IP resolved now; until
+    the ASN data is loaded, rows without a stored ASN are hidden too (fail closed).
+    Our own test traffic (self_ua_markers / self_nets) is left out too unless
+    show_self; the excluded networks stay out either way."""
+    if table not in PUBLIC_TABLES:
+        raise ValueError(table)
+    sql, args = "", []
     asns = sorted(EXCLUDE_ASNS)
-    ips = [r[0] for r in c.execute("SELECT DISTINCT ip FROM hits WHERE ip IS NOT NULL") if excluded_ip(r[0])]
-    sql = f" AND coalesce(asn, 0) NOT IN ({','.join('?' * len(asns))})" if asns else ""
-    if asns and not NET.ready:
-        sql += " AND asn IS NOT NULL"
-    if ips:
-        sql += f" AND ip NOT IN ({','.join('?' * len(ips))})"
-    return sql, (*asns, *ips)
+    if asns:
+        sql += f" AND coalesce(asn, 0) NOT IN ({','.join('?' * len(asns))})"
+        args += asns
+        if not NET.ready:
+            sql += " AND asn IS NOT NULL"
+    hide_self = not show_self
+    if len(EXCLUDE) or asns or (hide_self and len(SELF_NETS)):
+        ips = [r[0] for r in c.execute(f"SELECT DISTINCT ip FROM {table} WHERE ip IS NOT NULL")
+               if excluded_ip(r[0]) or (hide_self and self_ip(r[0]))]
+        if ips:
+            sql += f" AND ip NOT IN ({','.join('?' * len(ips))})"
+            args += ips
+    if hide_self and SELF_UA:
+        if table == "items":   # items keep the raw user agent
+            sql += " AND NOT (" + " OR ".join(["instr(lower(coalesce(ua, '')), ?) > 0"] * len(SELF_UA)) + ")"
+        else:                  # hits / houses point into uas
+            sql += (" AND coalesce(ua_id, 0) NOT IN (SELECT id FROM uas WHERE "
+                    + " OR ".join(["instr(lower(ua), ?) > 0"] * len(SELF_UA)) + ")")
+        args += SELF_UA
+    return sql, tuple(args)
 
 
 def public_query(path, query):
@@ -1269,12 +1344,13 @@ def public_query(path, query):
 INVITE_WRITE_SQL = "(path IN ('/post','/reply','/page','/kv','/count') OR path LIKE '/wiki/%')"
 
 
-def invite_funnel(c, since, public=True):
+def invite_funnel(c, since, public=True, show_self=False):
     """Per invitation tag since `since`: reads of its entry point (requests,
     distinct user agents), requests that carried the tag to a write route, and
-    notes left with it. public=True: the owner-network exclusion applies to
-    hits (public_hits) and to items (excluded_ip), like everywhere public."""
-    hide, hargs = public_hits(c) if public else ("", ())
+    notes left with it. public=True: the owner-network exclusion (and, unless
+    show_self, our own test traffic) applies to hits and items, like everywhere public."""
+    hide, hargs = public_hits(c, show_self) if public else ("", ())
+    ihide, iargs = public_hits(c, show_self, "items") if public else ("", ())
     reads = {}
     for _, paths in INVITES.values():
         if paths and paths not in reads:
@@ -1285,8 +1361,8 @@ def invite_funnel(c, since, public=True):
         f"SELECT invite, count(*) n, count(DISTINCT ua_id) u FROM hits WHERE ts>=? AND invite IS NOT NULL AND {INVITE_WRITE_SQL}{hide} "
         f"GROUP BY invite", (since, *hargs))}
     notes = {}
-    for r in c.execute("SELECT invite, status, ip, ua, ua_label FROM items WHERE created>=? AND invite IS NOT NULL "
-                       "ORDER BY id DESC LIMIT 5000", (since,)):
+    for r in c.execute(f"SELECT invite, status, ip, ua, ua_label FROM items WHERE created>=? AND invite IS NOT NULL{ihide} "
+                       "ORDER BY id DESC LIMIT 5000", (since, *iargs)):
         if public and excluded_ip(r["ip"]):
             continue
         d = notes.setdefault(r["invite"], {"n": 0, "vis": 0, "uas": set(), "labels": collections.Counter()})
@@ -1308,23 +1384,25 @@ def invite_funnel(c, since, public=True):
     return out
 
 
-def observatory_cached(window, ua_id, ip):
-    """Aggregates are recomputed at most once per TTL per (window, ua) by one
+def observatory_cached(window, ua_id, ip, show_self=False):
+    """Aggregates are recomputed at most once per TTL per (window, ua, self) by one
     thread; a client may trigger only a few recomputes (expensive bucket)."""
     def allow():
         b, r = CFG["rate_expensive_ip"]
         return LIMITER.take([(f"x:{ipkey(ip)}", b, r)])[0]
-    return OBS.get((window, ua_id), OBS_TTL[window], lambda: observatory(window, ua_id), allow=allow)
+    show_self = bool(show_self)
+    return OBS.get((window, ua_id, show_self), OBS_TTL[window], lambda: observatory(window, ua_id, show_self), allow=allow)
 
 
-def observatory(window, ua_id=None):
+def observatory(window, ua_id=None, show_self=False):
     now = int(time.time())
     span = {"1h": 3600, "24h": 86400, "7d": 7 * 86400}[window]
     bucket = {"1h": 60, "24h": 600, "7d": 3600}[window]
     since = now - span
     flt, args = ("AND ua_id=?", (ua_id,)) if ua_id else ("", ())
     with reader() as c:
-        hide, hargs = public_hits(c)
+        hide, hargs = public_hits(c, show_self)
+        ihide, iargs = public_hits(c, show_self, "items")
         flt, args = flt + hide, (*args, *hargs)
         tot = c.execute(f"SELECT count(*) n, count(DISTINCT ua_id) u, count(DISTINCT ip) i, count(DISTINCT asn) a, "
                         f"sum(kind='ai') ai FROM hits WHERE ts>=? {flt}", (since, *args)).fetchone()
@@ -1356,11 +1434,11 @@ def observatory(window, ua_id=None):
                          (since, *args)).fetchall()
         tail = c.execute(f"SELECT h.*, u.label, u.operator FROM hits h LEFT JOIN uas u ON u.id=h.ua_id "
                          f"WHERE 1=1 {flt.replace('ua_id', 'h.ua_id')} ORDER BY h.id DESC LIMIT 60", args).fetchall()
-        writes = c.execute("SELECT ua_label, kind, count(*) n, sum(status='visible') vis FROM items WHERE created>=? "
-                           "GROUP BY ua_label, kind ORDER BY n DESC LIMIT 20", (since,)).fetchall()
-        itot = c.execute("SELECT count(*) n FROM items WHERE created>=?", (since,)).fetchone()["n"]
-        inv = invite_funnel(c, since, public=True)
-        houses = houses_public(c, since, hide, hargs) if not ua_id else None
+        writes = c.execute(f"SELECT ua_label, kind, count(*) n, sum(status='visible') vis FROM items WHERE created>=?{ihide} "
+                           "GROUP BY ua_label, kind ORDER BY n DESC LIMIT 20", (since, *iargs)).fetchall()
+        itot = c.execute(f"SELECT count(*) n FROM items WHERE created>=?{ihide}", (since, *iargs)).fetchone()["n"]
+        inv = invite_funnel(c, since, public=True, show_self=show_self)
+        houses = houses_public(c, since, *public_hits(c, show_self, "houses")) if not ua_id else None
     buckets = {}
     for r in series:
         b = buckets.setdefault(r["b"], {"t": r["b"], "ai": 0, "auto": 0, "browser": 0})
@@ -1445,6 +1523,8 @@ def observatory(window, ua_id=None):
         "invitations": inv,
         "houses": houses,
         "asn_db": NET.ready,
+        # the site's own test tooling: hidden unless ?self=1 (the site's own servers: never shown)
+        "own_test_traffic": "shown" if show_self else "hidden",
     }
     if ua_id:
         u = q1("SELECT id, label, operator, kind, ua, first, last, n FROM uas WHERE id=?", (ua_id,))
@@ -1756,9 +1836,13 @@ class Public(hd.HardenedHandler):
             uid = num(ua)
             if ua and uid is None:
                 return self.json({"error": "ua must be a numeric id"}, 400)
-            if uid is not None and not q1("SELECT 1 FROM uas WHERE id=?", (uid,)):
-                return self.json({"error": "no such user agent id"}, 404)
-            return self.json(observatory_cached(win, uid, self.ip))
+            show_self = one(P, "self") in ("1", "true", "yes", "on")
+            if uid is not None:
+                u = q1("SELECT ua FROM uas WHERE id=?", (uid,))
+                # our own tooling's user agents do not exist publicly unless asked for
+                if not u or (not show_self and self_ua(u["ua"])):
+                    return self.json({"error": "no such user agent id"}, 404)
+            return self.json(observatory_cached(win, uid, self.ip, show_self))
         if p.startswith("/houses"):
             return self.houses(p)
 
