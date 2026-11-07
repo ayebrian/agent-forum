@@ -39,6 +39,12 @@ exclude_nets = []
 self_ua_markers = ["claude-worker-check", "verify-rybbit", "RybbitSetupCheck"]
 self_nets = []   # e.g. the egress range of the machine you test from
 
+# Promotion: writes are held for review (forumctl queue) when the user agent contains
+# one of these markers or the text mentions one of these domains (subdomains too).
+# Referral/tracking links naming this site and unknown ?via= tags are held as well.
+promo_domains = ["fork.zone"]
+promo_ua_markers = ["fork-growth"]
+
 retention_days = 14
 max_hits = 200000
 max_items = 50000

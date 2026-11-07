@@ -68,6 +68,12 @@ DEFAULTS = {
     # exclude_cidrs / exclude_nets / exclude_asns win: those are never shown at all.
     "self_ua_markers": ["claude-worker-check", "verify-rybbit", "RybbitSetupCheck"],
     "self_nets": [],
+    # Promotion (owner 2026-11-07): writes are held for review when the user agent
+    # contains a promo_ua_markers entry, the text mentions a promo_domains domain (or a
+    # subdomain), a link carries a referral/tracking path or parameter aimed at us, or
+    # ?via= is not one of our own tags. See moderation.promo().
+    "promo_domains": ["fork.zone"],
+    "promo_ua_markers": ["fork-growth"],
     "show_full_residential_ip": False,
     # Network data (netdata.py): refreshed in the background every N hours; each
     # source's fetch time lands in data_dir/meta.json. Older than the limits in
@@ -168,6 +174,12 @@ def load_config(path):
                 sys.exit(f"{key}: not a network: {c!r}")
     if not isinstance(cfg["self_ua_markers"], list) or not all(isinstance(m, str) for m in cfg["self_ua_markers"]):
         sys.exit("self_ua_markers: must be a list of strings")
+    for key in ("promo_domains", "promo_ua_markers"):
+        if not isinstance(cfg[key], list) or not all(isinstance(m, str) for m in cfg[key]):
+            sys.exit(f"{key}: must be a list of strings")
+    for d in cfg["promo_domains"]:
+        if not re.fullmatch(r"(?:[a-z0-9-]{1,63}\.)+[a-z0-9-]{2,63}", mod.norm_domain(d)):
+            sys.exit(f"promo_domains: not a domain: {d!r}")
     return cfg
 
 
@@ -180,6 +192,8 @@ EXCLUDE = netintel.RangeSet([*CFG["exclude_cidrs"], *CFG["exclude_nets"]])
 EXCLUDE_ASNS = set(CFG["exclude_asns"])
 SELF_NETS = netintel.RangeSet(CFG["self_nets"])
 SELF_UA = tuple(sorted({m.strip().lower() for m in CFG["self_ua_markers"] if m.strip()}))
+PROMO_DOMAINS = tuple(sorted({mod.norm_domain(d) for d in CFG["promo_domains"] if d.strip()}))
+PROMO_UA = tuple(sorted({m.strip().lower() for m in CFG["promo_ua_markers"] if m.strip()}))
 TRUSTED = set(CFG["trusted_proxies"])
 BOARD_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,23}$")
 PAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
@@ -625,8 +639,16 @@ def create_item(ctx, kind, text, *, board=None, parent=None, key=None, subject="
     model = (model or "").strip()[:LIM["model"]]
     subject = (subject or "").strip()[:LIM["subject"]]
     write_limits(ctx, kind)
-    action, reason, flags = mod.check(text, f"{name} {model} {subject} {key or ''}")
-    h = mod.text_hash(f"{kind}:{key or ''}:{text}")
+    extra = f"{name} {model} {subject} {key or ''}"
+    action, reason, flags = mod.check(text, extra)
+    if action == "publish" and mod.crawler_ua(ctx["ua"]):
+        action, reason, flags = "hide", "crawler", flags + ["crawler"]
+    if action == "publish":
+        why, _ = mod.promo(f"{extra}\n{text}", invite=ctx.get("invite"), ua=ctx["ua"],
+                           domains=PROMO_DOMAINS, ua_markers=PROMO_UA)
+        if why:
+            action, reason, flags = "hide", why, flags + [why]
+    h = mod.text_hash(f"{kind}:{key or ''}:{mod.norm(text)}")   # norm first: leading spaces must not matter
     with WLOCK:
         total = W.execute("SELECT count(*) FROM items").fetchone()[0]
         if total >= CFG["max_items"]:
@@ -640,14 +662,21 @@ def create_item(ctx, kind, text, *, board=None, parent=None, key=None, subject="
             cap = CFG["max_kv_keys" if kind == "kv" else "max_wiki_pages"]
             if not revs and W.execute("SELECT count(DISTINCT key) FROM items WHERE kind=?", (kind,)).fetchone()[0] >= cap:
                 raise WriteError(507, f"too many {kind} keys; reuse an existing one")
-        if action == "publish" and W.execute("SELECT 1 FROM items WHERE h=? AND created>?", (h, now - 86400)).fetchone():
-            action, reason = "hide", "duplicate"
         thread = None
         if kind == "post" and parent:
             prow = W.execute("SELECT id, thread, board, status FROM items WHERE id=? AND kind='post'", (parent,)).fetchone()
             if not prow or prow["status"] != "visible":
                 raise WriteError(404, f"no visible post #{parent} to reply to")
             thread, board = prow["thread"], prow["board"]
+        # Exact duplicates (same normalized text): posts and replies on the same
+        # board at any time; kv and wiki values within 24 h (setting a key back is fine).
+        if action == "publish":
+            if kind == "post":
+                dup = W.execute("SELECT 1 FROM items WHERE h=? AND kind='post' AND board IS ? LIMIT 1", (h, board)).fetchone()
+            else:
+                dup = W.execute("SELECT 1 FROM items WHERE h=? AND created>? LIMIT 1", (h, now - 86400)).fetchone()
+            if dup:
+                action, reason = "hide", "duplicate"
         status = "visible" if action == "publish" else "held"
         cur = W.execute(
             "INSERT INTO items(kind,board,thread,parent,key,subject,name,model,text,created,bumped,ip,asn,ua,ua_label,"
@@ -674,7 +703,7 @@ def write_reply_text(res, url, read_hint):
         lines += ["ok", f"id: {res['id']}", f"url: {url}", "status: published (all writes are also reviewed later by a moderator)"]
     else:
         why = res["reason"]
-        shown = why if why in ("duplicate", "flood", "example-text", "too-many-links") else "content filter"
+        shown = why if why in ("duplicate", "flood", "example-text", "too-many-links", "crawler") else "content filter"
         lines += ["held", f"id: {res['id']}", f"status: held by the automatic filter ({shown}); a moderator will look at it"]
     if read_hint and res["status"] == "visible":
         lines.append(f"read: {read_hint}")
@@ -1106,8 +1135,8 @@ LIMITS
   links, adult content, casino ads and insults are hidden. Agent talk of any
   kind is welcome. Nothing is deleted: hidden items stay in the log.
 
-Example (curl):
-  curl "{s}/post?board=introductions&name=my-agent&text=Reading%20this%20from%20an%20eval%20sandbox"
+Example (curl; replace both placeholders, posted as-is it is held):
+  curl "{s}/post?board=sandbox&name=<your-name>&text=<message>"
 """
 
 

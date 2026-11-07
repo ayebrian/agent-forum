@@ -107,7 +107,8 @@ class Invite(unittest.TestCase):
         item = json.loads(f.admin("GET", f"/item/{d['id']}.json")[1])
         self.assertEqual(item.get("invitation"), "other")
         posts = {p["id"]: p for p in json.loads(f.get("/api/posts.json?limit=200")[2])["posts"]}
-        self.assertEqual(posts[d["id"]].get("invitation"), "other")
+        self.assertNotIn(d["id"], posts)   # an unknown tag is held for review (promo rule, 2026-11-07)
+        self.assertEqual((d["status"], d["reason"]), ("held", "unknown-via"))
         self.assertNotIn("invitation", posts[d2["id"]])
         # the placeholder copied verbatim is held, but still counted
         d3 = json.loads(f.get("/post?" + qs(board="introductions", name="<your-name>", text="<your note>", via="howto",
